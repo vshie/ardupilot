@@ -43,6 +43,24 @@ static const uint8_t CMD_PRANGE_MAX_LSB = 0x16;
 // write to this address to start pressure measurement
 static const uint8_t CMD_REQUEST_MEASUREMENT = 0xAC;
 
+// Status byte layout returned as data[0] with the 5-byte measurement read.
+// See KELLER "Communication Protocol 4 LD...9 LD" (v2.6, pg 12) and the
+// Series 4LD...9LD datasheet (edition 07/2021).
+//   bit 7    : reserved, must be 0
+//   bit 6    : reserved, must be 1
+//   bit 5    : BUSY (1 = conversion in progress). Known to be unreliable
+//              when the status byte is returned as part of a block read
+//              rather than polled on its own, so it is intentionally not
+//              checked here.
+//   bits 4-3 : operating mode (00 = normal measurement)
+//   bit 2    : memory / EEPROM checksum error
+//   bits 1-0 : don't care
+// A healthy measurement read has status = 0b0100_00xx. The mask/expected
+// pair below asserts bit 7 = 0, bit 6 = 1, mode bits = 0, and checksum
+// error bit = 0, while leaving BUSY and the two low "don't care" bits free.
+static const uint8_t STATUS_REQUIRED_MASK = 0xDC;  // 1101 1100
+static const uint8_t STATUS_REQUIRED_BITS = 0x40;  // 0100 0000
+
 AP_Baro_KellerLD::AP_Baro_KellerLD(AP_Baro &baro, AP_HAL::OwnPtr<AP_HAL::Device> dev)
     : AP_Baro_Backend(baro)
     , _dev(std::move(dev))
@@ -232,7 +250,7 @@ bool AP_Baro_KellerLD::_read()
         return false;
     }
 
-    //uint8_t status = data[0];
+    const uint8_t status = data[0];
     uint16_t pressure_raw = (data[1] << 8) | data[2];
     uint16_t temperature_raw = (data[3] << 8) | data[4];
 
@@ -244,6 +262,15 @@ bool AP_Baro_KellerLD::_read()
         Debug("pressure_raw: %d\ttemperature_raw: %d", pressure_raw, temperature_raw);
     }
 #endif
+
+    // Reject the sample if the status byte indicates the sensor is not in
+    // the normal measurement state or is reporting a memory checksum error.
+    // This catches transient I2C / bus glitches that would otherwise slip
+    // through and produce wildly out-of-range pressure readings.
+    if ((status & STATUS_REQUIRED_MASK) != STATUS_REQUIRED_BITS) {
+        Debug("Keller: bad status byte 0x%02x", status);
+        return false;
+    }
 
     if (pressure_raw == 0 || temperature_raw == 0) {
         Debug("Keller: bad read");
